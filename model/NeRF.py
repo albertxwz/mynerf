@@ -42,6 +42,15 @@ class NeRF(nn.Module):
             nn.Linear(hidden_size + dir_size, hidden_size // 2), nn.ReLU(),
             nn.Linear(hidden_size // 2, 3), nn.Sigmoid(),
         )
+
+        def weights_init(m):
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight)
+                nn.init.constant_(m.bias, 0)
+
+        self.apply(weights_init)
+    
+
     
     def forward(self, x, dirs=None): # x: N_rays x embed_size
         out = self.block1(x)

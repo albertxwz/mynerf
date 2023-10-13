@@ -1,13 +1,15 @@
 import os
+import cv2
 import torch
 from torch import optim, nn
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+dtype = torch.float32
 # device = "cpu"
 from config.config_lego import Args
 from utils.render import render_rays, get_rays
-from utils.load_blender import Dataset
+from utils.load_blender import Dataset, get_render_poses
 from utils.utils import load_ckpt, save_ckpt, psnr_np, visualize, mkdir
 from model.loss import criterion, psnr
 from model.NeRF import NeRF
@@ -16,6 +18,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 import logging
 from torchvision.transforms.functional import center_crop
+import random
 
 def train(args, epoch, img, pose, H, W, focal, model, optimizer, model_fine=None):
     with torch.set_grad_enabled(True):
@@ -38,23 +41,39 @@ def train(args, epoch, img, pose, H, W, focal, model, optimizer, model_fine=None
             rays_d = torch.permute(rays_d, [1, 2, 0])
 
         shape = img.shape
-        img = img.reshape([-1, 3]).to(device)
-        rays_o = rays_o.reshape([-1, 3]).to(device)
-        rays_d = rays_d.reshape([-1, 3]).to(device)
+        img = img.reshape([-1, 3]).to(device, dtype=dtype)
+        rays_o = rays_o.reshape([-1, 3]).to(device, dtype=dtype)
+        rays_d = rays_d.reshape([-1, 3]).to(device, dtype=dtype)
 
         perm = torch.randperm(rays_o.shape[0])
-        idx = perm[:args.N_rand]
+        idx = perm[0:args.N_rand]
         img = img[idx, :]
         rays_o = rays_o[idx, :]
         rays_d = rays_d[idx, :]
+
+        # idx = np.random.randint(0, rays_o.shape[0])
+        # img = img[idx:idx+args.N_rand, :]
+        # rays_o = rays_o[idx:idx+args.N_rand, :]
+        # rays_d = rays_d[idx:idx+args.N_rand, :]
+
         results = render_rays(args, model, rays_o, rays_d, 2., 6., args.N_samples, True, model_fine, args.N_importance)
         if args.N_importance > 0:
             loss = criterion(results["rgb_coarse"], img) + criterion(results["rgb_fine"], img)
+            train_psnr = psnr(results["rgb_fine"], img)
         else:
             loss = criterion(results["rgb_coarse"], img)
+            train_psnr = psnr(results["rgb_coarse"], img)
+        
+        if torch.isinf(train_psnr) or torch.isnan(train_psnr):
+            logging.info(f"numerical error at {epoch}, loss {loss.item()}")
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
+
+        # if DEBUG:
+        #     for key in results:
+        #         if torch.isnan(results[key]).any() or torch.isinf(results[key]).any():
+        #             logging.info(f"! [Numerical Error] at epoch {epoch}, {key} contains nan or inf.")
 
         decay_rate = 0.1
         decay_steps = args.lrate_decay * 1000
@@ -63,7 +82,8 @@ def train(args, epoch, img, pose, H, W, focal, model, optimizer, model_fine=None
             param_group['lr'] = new_lrate
     
         loss = loss.detach().cpu().numpy()
-        return loss
+        train_psnr = train_psnr.detach().cpu().numpy()
+        return loss, train_psnr
 
         # for i in range(0, rays_o.shape[0], chunk):
         #     batched_rays_o = rays_o[i:i+chunk]
@@ -82,7 +102,18 @@ def train(args, epoch, img, pose, H, W, focal, model, optimizer, model_fine=None
         #     optimizer.step()
             # sum += loss.detach().cpu().numpy() * batched_rays_o.shape[0]
 
-def render_out(args, dataloader, model, model_fine = None, size=None, vis: bool = False, logdir = None, epoch = None, mode: str = "test"):
+def render_out(
+        args,
+        dataloader,
+        model,
+        model_fine = None,
+        size=None,
+        vis: bool = False,
+        logdir = None,
+        epoch = None,
+        mode: str = "test",
+        writer: SummaryWriter=None,
+):
     psnrlist = []
     dataiter = iter(dataloader)
     n_iter = len(dataloader)
@@ -90,6 +121,9 @@ def render_out(args, dataloader, model, model_fine = None, size=None, vis: bool 
         n_iter = size
     if epoch is None:
         epoch = "test"
+    video_writer = None
+    if mode == "test":
+        video_writer = cv2.VideoWriter(logdir + "/render.mp4", cv2.VideoWriter_fourcc(*'mp4v'), 30, (400, 400))
     with torch.no_grad():
         for _ in enumerate(tqdm(range(0, n_iter), leave=False, ascii=True, position=1)):
             img, pose, H, W, focal, filename = next(dataiter)
@@ -117,29 +151,46 @@ def render_out(args, dataloader, model, model_fine = None, size=None, vis: bool 
 
             res = torch.concat(res, 0)
             res = res.reshape(shape)
+            if writer is not None:
+                res = res.permute([2, 0, 1])
+                writer.add_image("val", res, epoch)
+                res = res.permute([1, 2, 0])
             res = res.detach().cpu().numpy()
             if vis:
-                visualize(epoch, res, logdir + "/" + mode, filename)
+                visualize(epoch, res, logdir, mode, filename, video_writer)
             psnrlist.append(psnr_np(res, img.numpy()))
+        if video_writer is not None:
+            video_writer.release()
     return np.array(psnrlist).mean()
 
     
 
-def val(args, epoch, val_set, model, model_fine = None, vis: bool = False, logdir = None):
+def val(args, epoch, val_set, model, model_fine = None, vis: bool = False, logdir=None, writer: SummaryWriter = None):
     model.eval()
     if model_fine is not None:
         model_fine.eval()
-    dataloader = DataLoader(val_set, 1, True, num_workers=2, pin_memory=True)
-    return render_out(args, dataloader, model, model_fine, args.val_size, vis, logdir, epoch, "val")
+    dataloader = DataLoader(val_set, 1, False, num_workers=2, pin_memory=True)
+    return render_out(args, dataloader, model, model_fine, args.val_size, vis, logdir, epoch=epoch, mode="val", writer=writer)
 
 def test(args, model, model_fine=None):
     model.eval()
     if model_fine is not None:
         model_fine.eval()
-    test_set = Dataset(args, "test")
-    dataloader = DataLoader(test_set, 1, False, num_workers=2, pin_memory=True)
+    test_set = Dataset(args, "val")
+    dataloader = DataLoader(test_set, 1, True, num_workers=2, pin_memory=True)
     logdir = os.path.join(args.logpath, args.dataset, args.exp_name)
-    return render_out(args, dataloader, model, model_fine, size=10, vis=True, logdir=logdir, mode="test")
+    render_poses = get_render_poses()
+    video_writer = cv2.VideoWriter(logdir + "/paper_render.mp4", cv2.VideoWriter_fourcc(*"mp4v"), 30, (400, 400))
+    with torch.no_grad():
+        for c2w in tqdm(render_poses):
+            rays_o, rays_d = get_rays(400, 400, test_set.focal, c2w)
+            rays_o = rays_o.cuda()
+            rays_d = rays_d.cuda()
+            results = render_rays(args, model, rays_o, rays_d, 2., 6., args.N_samples, True, model_fine, args.N_importance)
+            rgb = results["rgb_fine"]
+            visualize(None, rgb.detach().cpu().numpy(), logdir, "test", "paper_render.mp4", video_writer)
+    video_writer.release()
+    return render_out(args, dataloader, model, model_fine, size=40, vis=True, logdir=logdir, mode="test")
 
 
 def main():
@@ -147,6 +198,7 @@ def main():
 
     # init
     args = Args().parse_args()
+    random.seed(args.seed)
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
     torch.cuda.manual_seed(args.seed)
@@ -166,12 +218,13 @@ def main():
 
     lrate = args.lrate
     optimizer = optim.Adam(grad_vars, lr = args.lrate)
+    scheduler = optim.lr_scheduler.ExponentialLR(optimizer, args.gamma)
 
     if args.test_only:
-        if args.resume_filename is None:
+        if args.resume is None:
             print("No reference to the test model.")
             return
-        checkpoint = load_ckpt(args.resume_filename)
+        checkpoint = load_ckpt(args.resume)
         model.load_state_dict(checkpoint["model_state_dict"])
         if args.N_importance > 0:
             model_fine.load_state_dict(checkpoint["model_fine_state_dict"])
@@ -184,16 +237,18 @@ def main():
     # load
     st_epoch = 0
     losslist = []
+    psnrlist = []
     best_psnr = 0
-    if args.resume_filename is not None:
-        print(f"loading checkpoint {args.resume_filename}...")
+    if args.resume is not None:
+        print(f"loading checkpoint {args.resume}...")
         # st_epoch, best_psnr, model_state_dict, optimizer_state_dict, losslist, model_fine_state_dict = load_ckpt(args.resume_filename)
-        checkpoint = load_ckpt(args.resume_filename)
+        checkpoint = load_ckpt(args.resume)
         st_epoch = checkpoint["epoch"]
         best_psnr = checkpoint["best_psnr"]
         losslist = checkpoint["losslist"]
         model.load_state_dict(checkpoint["model_state_dict"])
         optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+        scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
         if args.N_importance > 0:
             model_fine.load_state_dict(checkpoint["model_fine_state_dict"])
 
@@ -216,6 +271,7 @@ def main():
         logger.info(model_fine)
 
     show_loss_epoch = len(trainloader)
+    scheduler_step = args.nums_iters // 100
 
     for epoch in tqdm(range(st_epoch + 1, args.nums_iters + 1), ascii=True, position=0):
         if (epoch - 1) % len(trainloader) == 0:
@@ -226,26 +282,35 @@ def main():
         H = H.squeeze(0)
         W = W.squeeze(0)
         focal = focal.squeeze(0)
-        loss = train(args, epoch, img, pose, H, W, focal, model, optimizer, model_fine)
+        loss, train_psnr = train(args, epoch, img, pose, H, W, focal, model, optimizer, model_fine)
+
+        # if epoch % scheduler_step == 0:
+        #     scheduler.step()
+
         losslist.append(loss)
+        psnrlist.append(train_psnr)
         # tqdm.write(f"loss: {loss:.6f}")
-        writer.add_scalar("loss", loss, epoch)
+        # writer.add_scalar("loss", loss, epoch)
+        # writer.add_scalar("train psnr", train_psnr, epoch)
         # logger.info(f"loss: {loss:.6f}")
         if epoch % args.ckpt_epoch == 0 and epoch > 0:
-            save_ckpt(logdir+"/"+args.dataset+"_ckpt", epoch, best_psnr, model, optimizer, losslist, model_fine)
+            save_ckpt(logdir+"/"+args.dataset+"_ckpt", args, epoch, best_psnr, model, optimizer, scheduler, losslist, model_fine)
         if epoch % show_loss_epoch == 0 and epoch > 0:
-            logger.info(f"avg loss: {sum(losslist[epoch-show_loss_epoch:epoch]) / show_loss_epoch : .6f}")
+            logger.info(f"""avg loss: {sum(losslist[epoch-show_loss_epoch:epoch]) / show_loss_epoch : .6f}
+                            avg train psnr: {sum(psnrlist[len(psnrlist)-show_loss_epoch:epoch]) / show_loss_epoch}""")
             writer.add_scalar("avg loss", sum(losslist[epoch-show_loss_epoch:epoch]) / show_loss_epoch, epoch)
+            writer.add_scalar("avg train psnr", sum(psnrlist[len(psnrlist)-show_loss_epoch:epoch]) / show_loss_epoch, epoch)
 
         if epoch % args.val_epoch == 0 and epoch >= args.start_val:
-            psnr = val(args, epoch, val_set, model, model_fine, vis=True, logdir=logdir)
+            psnr = val(args, epoch, val_set, model, model_fine, vis=True, logdir=logdir, writer=writer)
             tqdm.write(f"avg psnr: {psnr:.6f}")
             logger.info(f"avg psnr: {psnr:.6f}")
             writer.add_scalar("avg psnr", psnr, epoch)
             if psnr > best_psnr:
                 best_psnr = psnr
-                save_ckpt(logdir+"/"+args.dataset+"_best", epoch, best_psnr, model, optimizer, losslist, model_fine)
+                save_ckpt(logdir+"/"+args.dataset+"_best", args, epoch, best_psnr, model, optimizer, scheduler, losslist, model_fine)
     print(f"best psnr {best_psnr} Done.")
 
 if __name__ == "__main__":
+    torch.set_default_dtype(dtype)
     main()
