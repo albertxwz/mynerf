@@ -41,6 +41,11 @@ class Dataset(data.Dataset):
         super().__init__()
 
         base_dir = args.base_data
+        self.split = split
+        self.near, self.far = 2., 6.
+
+        if split == "test":
+            self.render_poses = get_render_poses()
 
         with open(join(base_dir, f"transforms_{split}.json"), 'r') as f:
             data_json = json.load(f)
@@ -92,8 +97,7 @@ class Dataset(data.Dataset):
         img = self.imgs[index]
         pose = self.poses[index]
 
-        return img, pose, self.H, self.W, self.focal, \
-              self.data_json["frames"][index]["file_path"].split('/')[-1] + ".png"
+        return img, pose, self.H, self.W, self.focal
 
 # import os
 # os.chdir("/home/x/xie77777/codes/mynerf")

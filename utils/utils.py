@@ -11,7 +11,7 @@ def psnr_np(input: np.ndarray, target: np.ndarray):
 def mkdir(dir_name: str):
     os.makedirs(dir_name, exist_ok=True)
 
-def visualize(epoch, img, filepath, mode, filename, video_writer=None):
+def visualize(epoch, img, filepath, mode, filename=None, video_writer=None):
     outdir = os.path.join(filepath, mode)
     mkdir(outdir)
     img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
@@ -53,8 +53,8 @@ def save_ckpt(
         best_psnr: float,
         model: torch.nn.Module,
         optimizer: torch.optim.Optimizer,
-        scheduler,
-        losslist: list,
+        scheduler = None,
+        losslist: list = None,
         model_fine: torch.nn.Module = None,
 ):
     checkpoint = {
@@ -63,12 +63,10 @@ def save_ckpt(
         "best_psnr": best_psnr,
         "model_state_dict": model.state_dict(),
         "optimizer_state_dict": optimizer.state_dict(),
-        "scheduler_state_dict": scheduler.state_dict(),
+        "scheduler_state_dict": None if scheduler is None else scheduler.state_dict(),
         "losslist": losslist,
+        "model_fine_state_dict": None if model_fine is None else model_fine.state_dict(),
     }
-
-    if model_fine is not None:
-        checkpoint.update({"model_fine_state_dict": model_fine.state_dict()})
 
     if filename[-4:] != ".pth":
         filename += ".pth"
@@ -127,18 +125,39 @@ def sample_pdf(z_vals: torch.Tensor, weights: torch.Tensor, N_samples: int, trai
 
     u = u.contiguous()
     idx = torch.searchsorted(cdf, u, right=True)
+    low = torch.max(torch.zeros_like(idx), idx-1)
+    up = torch.min(torch.ones_like(idx)*z_vals.shape[-1] - 1, idx)
 
-    leftbound = torch.gather(z_vals, -1, torch.max(torch.zeros_like(idx), idx-1))
-    rightboud = torch.gather(z_vals, -1, torch.min(torch.ones_like(idx)*z_vals.shape[-1] - 1, idx))
+    leftbound = torch.gather(z_vals, -1, low)
+    rightboud = torch.gather(z_vals, -1, up)
     # print(f"left: {leftbound} \n right: {rightboud}")
-    cdf_up = torch.gather(cdf, -1, idx)
-    cdf_low = torch.gather(cdf, -1, idx-1)
+    cdf_up = torch.gather(cdf, -1, up)
+    cdf_low = torch.gather(cdf, -1, low)
     denom = cdf_up - cdf_low
     denom = torch.where(denom < 1e-5, torch.ones_like(denom), denom)
     u = (u - cdf_low) / denom
     u = leftbound + u * (rightboud - leftbound)
 
     return u
+
+def ndc_rays(H, W, focal, near, rays_o, rays_d):
+    # Shift ray origins to near plane
+    t = -(near + rays_o[...,2]) / rays_d[...,2]
+    rays_o = rays_o + t[...,None] * rays_d
+    
+    # Projection
+    o0 = -1./(W/(2.*focal)) * rays_o[...,0] / rays_o[...,2]
+    o1 = -1./(H/(2.*focal)) * rays_o[...,1] / rays_o[...,2]
+    o2 = 1. + 2. * near / rays_o[...,2]
+
+    d0 = -1./(W/(2.*focal)) * (rays_d[...,0]/rays_d[...,2] - rays_o[...,0]/rays_o[...,2])
+    d1 = -1./(H/(2.*focal)) * (rays_d[...,1]/rays_d[...,2] - rays_o[...,1]/rays_o[...,2])
+    d2 = -2. * near / rays_o[...,2]
+    
+    rays_o = torch.stack([o0,o1,o2], -1)
+    rays_d = torch.stack([d0,d1,d2], -1)
+    
+    return rays_o, rays_d
     
 # test
 # import sys

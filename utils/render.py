@@ -11,8 +11,8 @@ from utils.utils import batchify, posenc, sample_pdf
 
 def get_rays_np(H, W, focal, c2w):
     i, j = np.meshgrid(
-        np.arange(H, dtype=np.float32),
         np.arange(W, dtype=np.float32),
+        np.arange(H, dtype=np.float32),
         indexing='xy',
     )
     dirs = np.stack([(i-W*.5)/focal, -(j-H*.5)/focal, -np.ones_like(i, dtype=np.float32)], -1)
@@ -22,8 +22,8 @@ def get_rays_np(H, W, focal, c2w):
 
 def get_rays(H, W, focal, c2w):
     i, j = torch.meshgrid(
-        torch.arange(H, dtype=torch.float32),
         torch.arange(W, dtype=torch.float32),
+        torch.arange(H, dtype=torch.float32),
         indexing='xy',
     )
     dirs = torch.stack([(i-W*.5)/focal, -(j-H*.5)/focal, -torch.ones_like(i)], -1)
@@ -38,6 +38,8 @@ def volume_render(
     pts: torch.Tensor,
     z_vals: torch.Tensor,
     white_bkgd: bool = False,
+    raw_noise_std: float = 0.,
+    testing: bool = False,
 ):
     # print("sigma, pts:", sigma.shape, pts.shape)
     # dists = torch.concat(
@@ -53,6 +55,17 @@ def volume_render(
     # logging.info(f"dists: {dists}\nsigma: {sigma}")
 
     # print(f"dist shape: {dists.shape}")
+
+    noise = 0.
+    if raw_noise_std > 0. and not testing:
+        noise = torch.randn_like(sigma) * raw_noise_std
+
+        # if testing:
+        #     np.random.seed(0)
+        #     noise = np.random.randn(*list(sigma.shape)) * raw_noise_std
+        #     noise = torch.Tensor(noise).to(device)
+    
+    sigma = torch.relu(sigma + noise)
 
     alpha = 1. - torch.exp(-sigma * dists)
 
@@ -83,6 +96,7 @@ def render_rays(
     # fine-grained net
     model_fine: torch.nn.Module = None,
     N_importance: int = 0,
+    dirs = None,
 ):
     # mine not correct ?!
     # z_vals = torch.linspace(near, far, N_samples+1, device=device)[..., :-1] + (far - near) / N_samples * .5
@@ -120,8 +134,7 @@ def render_rays(
     inputs = pts.reshape([-1, 3])
     inputs = posenc(args.L, inputs)
     if args.use_dirs:
-        viewdirs = rays_d[..., None, :].expand_as(pts).reshape([-1, 3])
-        viewdirs = viewdirs / torch.norm(viewdirs, dim=-1, keepdim=True)
+        viewdirs = dirs[..., None, :].expand_as(pts).reshape([-1, 3])
         viewdirs = posenc(args.L_dirs, viewdirs)
         rgb, sigma = batchify(model, inputs, viewdirs, use_dirs=True)
         # rgb, sigma = model(inputs, viewdirs)
@@ -134,7 +147,8 @@ def render_rays(
     # print(f"rgb: {rgb.shape}, sigma: {sigma.shape}")
     # logging.info(f"rgb {rgb.shape}\n sigma {sigma}")
 
-    rgb_map, depth_map, acc_map, weights = volume_render(rays_d, rgb, sigma, pts, z_vals, white_bkgd=args.white_bkgd)
+    rgb_map, depth_map, acc_map, weights = volume_render(rays_d, rgb, sigma, pts, z_vals, white_bkgd=args.white_bkgd,
+                                                         raw_noise_std=args.raw_noise_std, testing=not model.training)
 
     results = {
         "rgb_coarse": rgb_map,
@@ -145,7 +159,6 @@ def render_rays(
     if N_importance > 0:
 
         z_samples = sample_pdf((z_vals[..., 1:] + z_vals[..., :-1])*.5, weights[..., 1:-1], N_importance, model.training, not perturb, device=device)
-        # print(f"!!!!!!!!!!!!!!! {z_samples.dtype}")
         z_samples = z_samples.detach()
         z_vals = torch.concat([z_vals, z_samples], -1)
         z_vals, _ = torch.sort(z_vals, -1)
@@ -156,8 +169,7 @@ def render_rays(
         inputs = posenc(args.L, inputs)
 
         if args.use_dirs:
-            viewdirs = rays_d[..., None, :].expand_as(pts).reshape([-1, 3])
-            viewdirs = viewdirs / torch.norm(viewdirs, dim=-1, keepdim=True)
+            viewdirs = dirs[..., None, :].expand_as(pts).reshape([-1, 3])
             viewdirs = posenc(args.L_dirs, viewdirs)
             rgb, sigma = batchify(model_fine, inputs, viewdirs, use_dirs=True)
             # rgb, sigma = model_fine(inputs, viewdirs)

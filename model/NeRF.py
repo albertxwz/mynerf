@@ -34,9 +34,7 @@ class NeRF(nn.Module):
             nn.Linear(hidden_size, hidden_size), nn.ReLU(),
         )
 
-        self.output_sigma = nn.Sequential(
-            nn.Linear(hidden_size, 1), nn.ReLU(),
-        )
+        self.output_sigma = nn.Linear(hidden_size, 1)
 
         self.output_rgb = nn.Sequential(
             nn.Linear(hidden_size + dir_size, hidden_size // 2), nn.ReLU(),

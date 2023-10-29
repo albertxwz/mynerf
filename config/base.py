@@ -14,3 +14,10 @@ class Args(Tap):
     test_only: bool = False
     logpath: str = "./log"
     gamma: float = 0.95
+    spherify: bool = False
+    raw_noise_std: float = 0.
+    dataparallel: bool = False
+    no_ndc: bool = False
+    test_epoch: int = 50000
+    white_bkgd: bool = False
+    use_ndc: bool = False

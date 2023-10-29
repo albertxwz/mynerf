@@ -7,10 +7,12 @@ from torch.utils.tensorboard import SummaryWriter
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 dtype = torch.float32
 # device = "cpu"
-from config.config_lego import Args
+# change dataset
+from config.config_fern import Args
+from utils.load_llff import Dataset
+
 from utils.render import render_rays, get_rays
-from utils.load_blender import Dataset, get_render_poses
-from utils.utils import load_ckpt, save_ckpt, psnr_np, visualize, mkdir
+from utils.utils import load_ckpt, save_ckpt, psnr_np, visualize, mkdir, ndc_rays
 from model.loss import criterion, psnr
 from model.NeRF import NeRF
 from tqdm import tqdm
@@ -20,12 +22,14 @@ import logging
 from torchvision.transforms.functional import center_crop
 import random
 
-def train(args, epoch, img, pose, H, W, focal, model, optimizer, model_fine=None):
+def train(args, epoch, img, pose, H, W, focal, near, far, model, optimizer, model_fine=None, dirs=None):
     with torch.set_grad_enabled(True):
         model.train()
         if model_fine is not None:
             model_fine.train()
         rays_o, rays_d = get_rays(H, W, focal, pose)
+        dirs = rays_d
+        dirs = dirs / torch.norm(dirs, dim=-1, keepdim=True)
 
         if epoch <= args.precrop:
             H = H.numpy() // 2
@@ -44,19 +48,29 @@ def train(args, epoch, img, pose, H, W, focal, model, optimizer, model_fine=None
         img = img.reshape([-1, 3]).to(device, dtype=dtype)
         rays_o = rays_o.reshape([-1, 3]).to(device, dtype=dtype)
         rays_d = rays_d.reshape([-1, 3]).to(device, dtype=dtype)
+        dirs = dirs.reshape([-1, 3]).to(device, dtype=dtype)
 
+            
         perm = torch.randperm(rays_o.shape[0])
         idx = perm[0:args.N_rand]
         img = img[idx, :]
         rays_o = rays_o[idx, :]
         rays_d = rays_d[idx, :]
+        dirs = dirs[idx, :]
+        # img = img[:args.N_rand]
+        # rays_o = rays_o[:args.N_rand]
+        # rays_d = rays_d[:args.N_rand]
+        # dirs = dirs[:args.N_rand]
+
+        if args.use_ndc:
+            rays_o, rays_d = ndc_rays(H, W, focal, 1., rays_o, rays_d)
 
         # idx = np.random.randint(0, rays_o.shape[0])
         # img = img[idx:idx+args.N_rand, :]
         # rays_o = rays_o[idx:idx+args.N_rand, :]
         # rays_d = rays_d[idx:idx+args.N_rand, :]
 
-        results = render_rays(args, model, rays_o, rays_d, 2., 6., args.N_samples, True, model_fine, args.N_importance)
+        results = render_rays(args, model, rays_o, rays_d, near, far, args.N_samples, True, model_fine, args.N_importance, dirs)
         if args.N_importance > 0:
             loss = criterion(results["rgb_coarse"], img) + criterion(results["rgb_fine"], img)
             train_psnr = psnr(results["rgb_fine"], img)
@@ -102,48 +116,93 @@ def train(args, epoch, img, pose, H, W, focal, model, optimizer, model_fine=None
         #     optimizer.step()
             # sum += loss.detach().cpu().numpy() * batched_rays_o.shape[0]
 
-def render_out(
-        args,
-        dataloader,
-        model,
-        model_fine = None,
-        size=None,
-        vis: bool = False,
-        logdir = None,
-        epoch = None,
-        mode: str = "test",
-        writer: SummaryWriter=None,
-):
+# def render_out(
+#         args,
+#         dataloader,
+#         model,
+#         model_fine = None,
+#         size=None,
+#         vis: bool = False,
+#         logdir = None,
+#         epoch = None,
+#         mode: str = "test",
+#         writer: SummaryWriter=None,
+# ):
+#     psnrlist = []
+#     dataiter = iter(dataloader)
+#     n_iter = len(dataloader)
+#     if size is not None:
+#         n_iter = size
+#     with torch.no_grad():
+#         for _ in enumerate(tqdm(range(0, n_iter), leave=False, ascii=True, position=1)):
+#             img, pose, H, W, focal, filename = next(dataiter)
+#             img = img.squeeze(0)
+#             pose = pose.squeeze(0)
+#             filename = filename[0]
+#             H = H.squeeze(0)
+#             W = W.squeeze(0)
+#             rays_o, rays_d = get_rays(H, W, focal, pose)
+#             shape = img.shape
+#             chunk = args.N_rand
+#             rays_o = rays_o.reshape([-1, 3]).to(device)
+#             rays_d = rays_d.reshape([-1, 3]).to(device)
+#             res = []
+#             for i in range(0, rays_o.shape[0], chunk):
+#                 batched_rays_o = rays_o[i:i+chunk]
+#                 batched_rays_d = rays_d[i:i+chunk]
+#                 # batched_rays_d = batched_rays_d.to(device)
+#                 # batched_rays_o = batched_rays_o.to(device)
+#                 results = render_rays(args, model, batched_rays_o, batched_rays_d, near, far, args.N_samples, True, model_fine, args.N_importance)
+#                 rgb = results["rgb_coarse"]
+#                 if args.N_importance > 0:
+#                     rgb = results["rgb_fine"]
+#                 res.append(rgb)
+
+#             res = torch.concat(res, 0)
+#             res = res.reshape(shape)
+#             if writer is not None:
+#                 res = res.permute([2, 0, 1])
+#                 writer.add_image("val", res, epoch)
+#                 res = res.permute([1, 2, 0])
+#             res = res.detach().cpu().numpy()
+#             if vis:
+#                 visualize(epoch, res, logdir, mode, filename)
+#             psnrlist.append(psnr_np(res, img.numpy()))
+#     return np.array(psnrlist).mean()
+
+    
+
+def val(args, epoch, val_set, model, model_fine = None, vis: bool = False, logdir=None, writer: SummaryWriter = None):
+    model.eval()
+    if model_fine is not None:
+        model_fine.eval()
+    dataloader = DataLoader(val_set, 1, False, num_workers=2, pin_memory=True)
     psnrlist = []
     dataiter = iter(dataloader)
-    n_iter = len(dataloader)
-    if size is not None:
-        n_iter = size
-    if epoch is None:
-        epoch = "test"
-    video_writer = None
-    if mode == "test":
-        video_writer = cv2.VideoWriter(logdir + "/render.mp4", cv2.VideoWriter_fourcc(*'mp4v'), 30, (400, 400))
+    n_iter = args.val_size
     with torch.no_grad():
         for _ in enumerate(tqdm(range(0, n_iter), leave=False, ascii=True, position=1)):
-            img, pose, H, W, focal, filename = next(dataiter)
+            img, pose, H, W, focal = next(dataiter)
             img = img.squeeze(0)
             pose = pose.squeeze(0)
-            filename = filename[0]
             H = H.squeeze(0)
             W = W.squeeze(0)
             rays_o, rays_d = get_rays(H, W, focal, pose)
+            dirs = rays_d
+            dirs = dirs / torch.norm(dirs, dim=-1, keepdim=True)
+            if args.use_ndc:
+                rays_o, rays_d = ndc_rays(H, W, focal, 1., rays_o, rays_d)
             shape = img.shape
             chunk = args.N_rand
             rays_o = rays_o.reshape([-1, 3]).to(device)
             rays_d = rays_d.reshape([-1, 3]).to(device)
+            dirs = dirs.reshape([-1, 3]).to(device)
             res = []
             for i in range(0, rays_o.shape[0], chunk):
                 batched_rays_o = rays_o[i:i+chunk]
                 batched_rays_d = rays_d[i:i+chunk]
-                # batched_rays_d = batched_rays_d.to(device)
-                # batched_rays_o = batched_rays_o.to(device)
-                results = render_rays(args, model, batched_rays_o, batched_rays_d, 2., 6., args.N_samples, True, model_fine, args.N_importance)
+                batched_dirs = dirs[i:i+chunk]
+                results = render_rays(args, model, batched_rays_o, batched_rays_d, val_set.near, val_set.far, args.N_samples, True, model_fine, args.N_importance, batched_dirs)
                 rgb = results["rgb_coarse"]
                 if args.N_importance > 0:
                     rgb = results["rgb_fine"]
@@ -156,41 +215,48 @@ def render_out(
                 writer.add_image("val", res, epoch)
                 res = res.permute([1, 2, 0])
             res = res.detach().cpu().numpy()
-            if vis:
-                visualize(epoch, res, logdir, mode, filename, video_writer)
             psnrlist.append(psnr_np(res, img.numpy()))
-        if video_writer is not None:
-            video_writer.release()
     return np.array(psnrlist).mean()
 
-    
-
-def val(args, epoch, val_set, model, model_fine = None, vis: bool = False, logdir=None, writer: SummaryWriter = None):
+def test(args, model, model_fine=None, epoch=None):
     model.eval()
     if model_fine is not None:
         model_fine.eval()
-    dataloader = DataLoader(val_set, 1, False, num_workers=2, pin_memory=True)
-    return render_out(args, dataloader, model, model_fine, args.val_size, vis, logdir, epoch=epoch, mode="val", writer=writer)
-
-def test(args, model, model_fine=None):
-    model.eval()
-    if model_fine is not None:
-        model_fine.eval()
-    test_set = Dataset(args, "val")
+    test_set = Dataset(args, "test")
     dataloader = DataLoader(test_set, 1, True, num_workers=2, pin_memory=True)
     logdir = os.path.join(args.logpath, args.dataset, args.exp_name)
-    render_poses = get_render_poses()
-    video_writer = cv2.VideoWriter(logdir + "/paper_render.mp4", cv2.VideoWriter_fourcc(*"mp4v"), 30, (400, 400))
+    render_poses = test_set.render_poses
+    if epoch is None:
+        epoch = "test"
+    H, W, focal = render_poses[0, :, -1]
+    H, W = int(H), int(W)
+    video_writer = cv2.VideoWriter(logdir + f"/paper_render_{epoch}.mp4", cv2.VideoWriter_fourcc(*"mp4v"), 30, (W, H))
     with torch.no_grad():
         for c2w in tqdm(render_poses):
-            rays_o, rays_d = get_rays(400, 400, test_set.focal, c2w)
-            rays_o = rays_o.cuda()
-            rays_d = rays_d.cuda()
-            results = render_rays(args, model, rays_o, rays_d, 2., 6., args.N_samples, True, model_fine, args.N_importance)
-            rgb = results["rgb_fine"]
-            visualize(None, rgb.detach().cpu().numpy(), logdir, "test", "paper_render.mp4", video_writer)
+            if c2w.shape[-1] == 5:
+                H, W, focal = c2w[:, -1]
+                H, W = int(H), int(W)
+                c2w = torch.Tensor(c2w[:, :-1])
+            rays_o, rays_d = get_rays(H, W, focal, c2w)
+            dirs = rays_d
+            dirs = dirs / torch.norm(dirs, dim=-1, keepdim=True)
+            if args.use_ndc:
+                rays_o, rays_d = ndc_rays(H, W, focal, 1., rays_o, rays_d)
+            shape = rays_o.shape
+            rays_o = rays_o.reshape([-1, 3]).to(device)
+            rays_d = rays_d.reshape([-1, 3]).to(device)
+            dirs = dirs.reshape([-1, 3]).to(device)
+            rgb = []
+            for i in range(0, rays_o.shape[0], args.N_rand):
+                brays_o = rays_o[i:i+args.N_rand, :]
+                brays_d = rays_d[i:i+args.N_rand, :]
+                bdirs = dirs[i:i+args.N_rand, :]
+                results = render_rays(args, model, brays_o, brays_d, test_set.near, test_set.far, args.N_samples, True, model_fine, args.N_importance, bdirs)
+                rgb.append(results["rgb_fine"])
+            rgb = torch.concat(rgb, 0)
+            rgb = rgb.reshape(shape)
+            visualize(None, rgb.detach().cpu().numpy(), logdir, "test", video_writer=video_writer)
     video_writer.release()
-    return render_out(args, dataloader, model, model_fine, size=40, vis=True, logdir=logdir, mode="test")
 
 
 def main():
@@ -207,13 +273,15 @@ def main():
 
     model = NeRF(L_embed_dir=args.L_dirs, L_embed_loc=args.L)
     model = model.to(device)
-    # model = nn.DataParallel(model, device_ids=[0, 1])
+    if args.dataparallel:
+        model = nn.DataParallel(model, device_ids=[0, 1])
     model_fine = None
     grad_vars = list(model.parameters())
     if args.N_importance > 0:
         model_fine = NeRF(L_embed_dir=args.L_dirs, L_embed_loc=args.L)
         model_fine = model_fine.to(device)
-        # model_fine = nn.DataParallel(model_fine, device_ids=[0, 1])
+        if args.dataparallel:
+            model_fine = nn.DataParallel(model_fine, device_ids=[0, 1])
         grad_vars += list(model_fine.parameters())
 
     lrate = args.lrate
@@ -228,7 +296,7 @@ def main():
         model.load_state_dict(checkpoint["model_state_dict"])
         if args.N_importance > 0:
             model_fine.load_state_dict(checkpoint["model_fine_state_dict"])
-        print(f"psnr: {test(args, model, model_fine)}")
+        test(args, model, model_fine)
         return
 
     train_set, val_set = Dataset(args, "train"), Dataset(args, "val")
@@ -248,7 +316,6 @@ def main():
         losslist = checkpoint["losslist"]
         model.load_state_dict(checkpoint["model_state_dict"])
         optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
-        scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
         if args.N_importance > 0:
             model_fine.load_state_dict(checkpoint["model_fine_state_dict"])
 
@@ -270,19 +337,19 @@ def main():
     if model_fine is not None:
         logger.info(model_fine)
 
-    show_loss_epoch = len(trainloader)
-    scheduler_step = args.nums_iters // 100
+    show_loss_epoch = max(len(trainloader), 100)
+    print(f"logging every {show_loss_epoch} epoch.")
 
     for epoch in tqdm(range(st_epoch + 1, args.nums_iters + 1), ascii=True, position=0):
         if (epoch - 1) % len(trainloader) == 0:
             train_iter = iter(trainloader)
-        img, pose, H, W, focal, _ = next(train_iter)
+        img, pose, H, W, focal = next(train_iter)
         img = img.squeeze(0)
         pose = pose.squeeze(0)
         H = H.squeeze(0)
         W = W.squeeze(0)
         focal = focal.squeeze(0)
-        loss, train_psnr = train(args, epoch, img, pose, H, W, focal, model, optimizer, model_fine)
+        loss, train_psnr = train(args, epoch, img, pose, H, W, focal, train_set.near, train_set.far, model, optimizer, model_fine)
 
         # if epoch % scheduler_step == 0:
         #     scheduler.step()
@@ -294,12 +361,15 @@ def main():
         # writer.add_scalar("train psnr", train_psnr, epoch)
         # logger.info(f"loss: {loss:.6f}")
         if epoch % args.ckpt_epoch == 0 and epoch > 0:
-            save_ckpt(logdir+"/"+args.dataset+"_ckpt", args, epoch, best_psnr, model, optimizer, scheduler, losslist, model_fine)
+            save_ckpt(logdir+"/"+args.dataset+"_ckpt", args, epoch, best_psnr, model, optimizer, losslist=losslist, model_fine=model_fine)
         if epoch % show_loss_epoch == 0 and epoch > 0:
             logger.info(f"""avg loss: {sum(losslist[epoch-show_loss_epoch:epoch]) / show_loss_epoch : .6f}
                             avg train psnr: {sum(psnrlist[len(psnrlist)-show_loss_epoch:epoch]) / show_loss_epoch}""")
             writer.add_scalar("avg loss", sum(losslist[epoch-show_loss_epoch:epoch]) / show_loss_epoch, epoch)
             writer.add_scalar("avg train psnr", sum(psnrlist[len(psnrlist)-show_loss_epoch:epoch]) / show_loss_epoch, epoch)
+        
+        if epoch % args.test_epoch == 0:
+            test(args, model, model_fine, epoch)
 
         if epoch % args.val_epoch == 0 and epoch >= args.start_val:
             psnr = val(args, epoch, val_set, model, model_fine, vis=True, logdir=logdir, writer=writer)
@@ -308,7 +378,7 @@ def main():
             writer.add_scalar("avg psnr", psnr, epoch)
             if psnr > best_psnr:
                 best_psnr = psnr
-                save_ckpt(logdir+"/"+args.dataset+"_best", args, epoch, best_psnr, model, optimizer, scheduler, losslist, model_fine)
+                save_ckpt(logdir+"/"+args.dataset+"_best", args, epoch, best_psnr, model, optimizer, losslist=losslist, model_fine=model_fine)
     print(f"best psnr {best_psnr} Done.")
 
 if __name__ == "__main__":
